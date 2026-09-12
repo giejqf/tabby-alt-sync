@@ -169,12 +169,11 @@ pub async fn read_body(req: Request, max_body_bytes: usize) -> Result<Bytes, Api
 
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|error| {
-            let text = error.to_string();
-            if text.contains("length limit exceeded") {
+            if is_length_limit_error(&error) {
                 ApiError::PayloadTooLarge
             } else {
-                tracing::debug!(error = %text, "failed to read request body");
-                ApiError::JsonParse(text)
+                tracing::debug!(error = %error, "failed to read request body");
+                ApiError::JsonParse(error.to_string())
             }
         })?;
         if let Some(data) = frame.data_ref() {
@@ -186,6 +185,21 @@ pub async fn read_body(req: Request, max_body_bytes: usize) -> Result<Bytes, Api
     }
 
     Ok(Bytes::from(collected))
+}
+
+/// `tower-http`'s body limit surfaces as a boxed
+/// [`http_body_util::LengthLimitError`] somewhere in the request-body error
+/// chain. Match the type rather than the human-readable message, which is not
+/// part of any API contract.
+fn is_length_limit_error(error: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        if current.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 /// Parses a request body the way DRF's JSON parser sees it: an empty body
