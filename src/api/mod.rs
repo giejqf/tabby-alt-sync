@@ -30,7 +30,7 @@ const ALLOW_METHODS: &str = "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 const ALLOW_HEADERS: &str = "authorization, content-type";
 const MAX_AGE: &str = "86400";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     pub db: Db,
     pub secret: Arc<TokenSecret>,
@@ -39,6 +39,18 @@ pub struct AppState {
     pub token: Arc<str>,
     pub username: Arc<str>,
     pub max_body_bytes: usize,
+}
+
+impl std::fmt::Debug for AppState {
+    /// Redacts `token` (and the token digest) so that a stray `{:?}` can never
+    /// put the credential into a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("db", &self.db)
+            .field("username", &self.username)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -326,5 +338,24 @@ mod tests {
         assert!(path.contains("foo=bar"));
         assert!(path.contains("%61uth%5ftoken=[redacted]"));
         assert!(path.contains("auth_token=[redacted]"));
+    }
+
+    #[test]
+    fn app_state_debug_redacts_the_token() {
+        const SECRET: &str = "super-secret-token-0123456789";
+        let state = AppState {
+            db: Db::open_in_memory().expect("db"),
+            secret: Arc::new(TokenSecret::new(SECRET)),
+            token: Arc::from(SECRET),
+            username: Arc::from("tabby"),
+            max_body_bytes: 1024,
+        };
+        let rendered = format!("{state:?}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(rendered.contains("tabby"), "{rendered}");
+        assert_eq!(
+            format!("{:?}", TokenSecret::new(SECRET)),
+            "TokenSecret { .. }"
+        );
     }
 }

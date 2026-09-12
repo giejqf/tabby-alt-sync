@@ -20,9 +20,15 @@ fn digest(value: &str) -> [u8; 32] {
 
 /// The configured token, kept only as a SHA-256 digest so that comparisons leak
 /// neither the value nor the length of the token through timing.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenSecret {
     digest: [u8; 32],
+}
+
+impl std::fmt::Debug for TokenSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenSecret").finish_non_exhaustive()
+    }
 }
 
 impl TokenSecret {
