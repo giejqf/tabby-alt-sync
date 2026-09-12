@@ -120,10 +120,10 @@ fn create(state: &AppState, body: Option<Map<String, Value>>) -> Result<Response
     errors.finish()?;
 
     let conn = state.db.lock()?;
-    let timestamp = time::now_wire()?;
+    let (timestamp, date) = time::now_wire_and_date()?;
     let name = match name {
         Some(name) if !name.is_empty() => name,
-        _ => fallback_name()?,
+        _ => format!("Unnamed config ({date})"),
     };
     let row = configs::create(
         &conn,
@@ -192,10 +192,6 @@ fn provided_name(
         rules = rules.allow_blank();
     }
     string_field(body, "name", rules, errors)
-}
-
-fn fallback_name() -> Result<String, ApiError> {
-    Ok(format!("Unnamed config ({})", time::today_wire()?))
 }
 
 fn method_of(req: &Request) -> &str {

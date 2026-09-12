@@ -44,7 +44,10 @@ pub fn now_wire() -> Result<String, TimeError> {
     Ok(now_utc()?.format(DATETIME_FORMAT)?)
 }
 
-/// Current UTC date as `YYYY-MM-DD`.
-pub fn today_wire() -> Result<String, TimeError> {
-    Ok(now_utc()?.format(DATE_FORMAT)?)
+/// A single clock reading rendered as both the wire timestamp and the UTC date
+/// used by the `Unnamed config (…)` fallback. Deriving both from one instant
+/// means they can never disagree across a UTC midnight.
+pub fn now_wire_and_date() -> Result<(String, String), TimeError> {
+    let now = now_utc()?;
+    Ok((now.format(DATETIME_FORMAT)?, now.format(DATE_FORMAT)?))
 }
