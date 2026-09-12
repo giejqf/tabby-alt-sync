@@ -3,7 +3,7 @@ name = "tabby-alt-sync"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal single-user config sync host for Tabby"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
