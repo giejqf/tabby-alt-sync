@@ -56,6 +56,29 @@ Built-in TLS uses PEM certificate and key files; both flags are required togethe
 
 For local testing a self-signed certificate is fine for `curl`, but a real client needs a certificate it trusts. [mkcert](https://github.com/FiloSottile/mkcert) is the easy way to get a locally trusted one. Alternatively, keep the server on loopback and put a reverse proxy (Caddy, nginx, …) in front for TLS.
 
+## Docker
+
+Prebuilt `linux/amd64` and `linux/arm64` images are published to GitHub Container Registry on every push to `main` (tagged `latest`) and on `v*` tags.
+
+```bash
+docker run -d \
+  --name tabby-alt-sync \
+  -e TABBY_ALT_SYNC_TOKEN=<token> \
+  -p 9600:9600 \
+  -v tabby-alt-sync-data:/data \
+  ghcr.io/giejqf/tabby-alt-sync:latest
+```
+
+The image runs as an unprivileged user, binds `0.0.0.0:9600` inside the container, and keeps its SQLite database in `/data` (declared as a volume). Configure it with the same `TABBY_ALT_SYNC_*` environment variables as the binary; extra CLI arguments are appended to the entrypoint.
+
+The image serves plain HTTP, and real clients require HTTPS: mount a certificate/key and append `--tls-cert`/`--tls-key`, or terminate TLS at a reverse proxy in front of it.
+
+To build locally:
+
+```bash
+docker build -t tabby-alt-sync .
+```
+
 ## Configuration
 
 Every setting has an environment variable prefixed `TABBY_ALT_SYNC_`; a matching CLI flag overrides it.

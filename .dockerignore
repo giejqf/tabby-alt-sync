@@ -1,0 +1,7 @@
+target/
+tabby/
+.git/
+.github/
+*.db
+*.db-wal
+*.db-shm
