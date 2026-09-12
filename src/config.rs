@@ -119,6 +119,9 @@ pub enum ConfigError {
 
     #[error("TABBY_ALT_SYNC_MAX_BODY_BYTES must be greater than zero")]
     InvalidBodyLimit,
+
+    #[error("TABBY_ALT_SYNC_MAX_BODY_BYTES is too large for this platform")]
+    BodyLimitTooLarge,
 }
 
 /// Raw, unvalidated input. Kept separate from [`Settings`] so the validation
@@ -166,13 +169,15 @@ impl Settings {
         if input.max_body_bytes == 0 {
             return Err(ConfigError::InvalidBodyLimit);
         }
+        let max_body_bytes =
+            usize::try_from(input.max_body_bytes).map_err(|_| ConfigError::BodyLimitTooLarge)?;
 
         Ok(Self {
             token,
             bind: input.bind,
             db: input.db.to_path_buf(),
             username: input.username.to_owned(),
-            max_body_bytes: input.max_body_bytes as usize,
+            max_body_bytes,
             tls,
             log: input.log.to_owned(),
         })
@@ -343,6 +348,17 @@ mod tests {
         assert!(matches!(
             Settings::build(zero),
             Err(ConfigError::InvalidBodyLimit)
+        ));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn a_body_limit_larger_than_usize_is_refused() {
+        let mut huge = input();
+        huge.max_body_bytes = u64::from(u32::MAX) + 1;
+        assert!(matches!(
+            Settings::build(huge),
+            Err(ConfigError::BodyLimitTooLarge)
         ));
     }
 
