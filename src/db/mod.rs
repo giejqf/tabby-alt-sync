@@ -26,6 +26,9 @@ pub enum DbError {
         source: rusqlite::Error,
     },
 
+    #[error("meta.schema_version {0:?} is not a number; refusing to migrate")]
+    SchemaVersion(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -100,9 +103,10 @@ fn migrate(conn: &mut Connection) -> Result<(), DbError> {
         )",
     )?;
 
-    let current: i64 = meta_get(&tx, KEY_SCHEMA_VERSION)?
-        .map(|v| v.parse().unwrap_or(0))
-        .unwrap_or(0);
+    let current: i64 = match meta_get(&tx, KEY_SCHEMA_VERSION)? {
+        Some(value) => value.parse().map_err(|_| DbError::SchemaVersion(value))?,
+        None => 0,
+    };
 
     for &(version, sql) in MIGRATIONS {
         if version > current {
@@ -176,6 +180,17 @@ mod tests {
                 .as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn corrupt_schema_version_is_an_error() {
+        let db = Db::open_in_memory().expect("db");
+        let mut conn = db.lock().expect("lock");
+        meta_set(&conn, KEY_SCHEMA_VERSION, Some("not-a-number")).expect("set");
+        assert!(matches!(
+            migrate(&mut conn),
+            Err(DbError::SchemaVersion(value)) if value == "not-a-number"
+        ));
     }
 
     #[test]
