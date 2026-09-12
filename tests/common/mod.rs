@@ -22,6 +22,7 @@ pub const TOKEN: &str = "test-token-0123456789abcdef";
 pub const DEFAULT_BODY_LIMIT: usize = 8 * 1024 * 1024;
 pub const TOKEN_QUERY_PARAM: &str = "auth_token";
 
+#[derive(Clone)]
 pub struct TestApp {
     pub router: Router,
     pub token: &'static str,

@@ -19,7 +19,7 @@ use tracing::Level;
 
 use crate::auth::{self, TokenSecret};
 use crate::db::Db;
-use error::ApiError;
+use error::{ApiError, ValidationErrors};
 
 /// Single implicit user. Upstream serialises relations as integer primary keys
 /// (`fields = "__all__"` on a `ModelSerializer`), so this shows up verbatim in
@@ -132,12 +132,15 @@ fn redact_query(query: &str) -> String {
     query
         .split('&')
         .map(|pair| {
-            let key = pair.split('=').next().unwrap_or(pair);
-            if key.eq_ignore_ascii_case(auth::TOKEN_QUERY_PARAM) {
-                "auth_token=[redacted]"
-            } else {
-                pair
+            let raw_key = pair.split('=').next().unwrap_or(pair);
+            let decoded_key: String = form_urlencoded::parse(raw_key.as_bytes())
+                .next()
+                .map(|(key, _)| key.into_owned())
+                .unwrap_or_else(|| raw_key.to_owned());
+            if decoded_key.eq_ignore_ascii_case(auth::TOKEN_QUERY_PARAM) {
+                return format!("{raw_key}=[redacted]");
             }
+            pair.to_owned()
         })
         .collect::<Vec<_>>()
         .join("&")
@@ -187,17 +190,95 @@ pub fn parse_json_object(body: &[u8]) -> Result<Option<Map<String, Value>>, ApiE
     }
 }
 
-/// Reads a field the way DRF's `CharField` does: strings are taken verbatim,
-/// numbers are coerced, booleans and composites are rejected, and an explicit
-/// `null` is reported separately so nullable columns can distinguish it.
+#[derive(Clone, Copy)]
+pub struct CharFieldRules {
+    pub max_length: Option<usize>,
+    pub trim_whitespace: bool,
+    pub allow_blank: bool,
+    pub prohibit_null_characters: bool,
+}
+
+impl CharFieldRules {
+    pub const fn new(max_length: Option<usize>) -> Self {
+        Self {
+            max_length,
+            trim_whitespace: true,
+            allow_blank: false,
+            prohibit_null_characters: true,
+        }
+    }
+
+    pub const fn raw(mut self) -> Self {
+        self.trim_whitespace = false;
+        self.prohibit_null_characters = false;
+        self
+    }
+
+    pub const fn allow_blank(mut self) -> Self {
+        self.allow_blank = true;
+        self
+    }
+}
+
+fn add_string_error(errors: &mut ValidationErrors, field: &str, message: &str) {
+    errors.add(field, message);
+}
+
+fn normalize_string(
+    field: &str,
+    value: &Value,
+    rules: CharFieldRules,
+    errors: &mut ValidationErrors,
+) -> Option<String> {
+    let mut value = match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => {
+            add_string_error(errors, field, "This field may not be null.");
+            return None;
+        }
+        _ => {
+            add_string_error(errors, field, "Not a valid string.");
+            return None;
+        }
+    };
+
+    if rules.trim_whitespace {
+        value = value.trim().to_owned();
+    }
+
+    if value.is_empty() && !rules.allow_blank {
+        add_string_error(errors, field, "This field may not be blank.");
+        return None;
+    }
+
+    if let Some(max_length) = rules.max_length {
+        if value.chars().count() > max_length {
+            add_string_error(
+                errors,
+                field,
+                &format!("Ensure this field has no more than {max_length} characters."),
+            );
+            return None;
+        }
+    }
+
+    if rules.prohibit_null_characters && value.contains('\u{0}') {
+        add_string_error(errors, field, "Null characters are not allowed.");
+        return None;
+    }
+
+    Some(value)
+}
+
+/// `None` means the key was absent or validation failed; failures are accumulated.
 pub fn string_field(
     body: Option<&Map<String, Value>>,
     field: &str,
-) -> Result<Option<String>, ApiError> {
-    match field_value(body, field) {
-        None => Ok(None),
-        Some(value) => Ok(Some(coerce_string(field, value)?)),
-    }
+    rules: CharFieldRules,
+    errors: &mut ValidationErrors,
+) -> Option<String> {
+    field_value(body, field).and_then(|value| normalize_string(field, value, rules, errors))
 }
 
 /// `None` — key absent, leave the stored value alone.
@@ -206,11 +287,13 @@ pub fn string_field(
 pub fn nullable_string_field(
     body: Option<&Map<String, Value>>,
     field: &str,
-) -> Result<Option<Option<String>>, ApiError> {
+    rules: CharFieldRules,
+    errors: &mut ValidationErrors,
+) -> Option<Option<String>> {
     match field_value(body, field) {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
-        Some(value) => Ok(Some(Some(coerce_string(field, value)?))),
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(value) => normalize_string(field, value, rules, errors).map(Some),
     }
 }
 
@@ -221,18 +304,6 @@ pub(crate) fn field_value<'a>(
     body.and_then(|fields| fields.get(field))
 }
 
-fn coerce_string(field: &str, value: &Value) -> Result<String, ApiError> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        Value::Number(number) => Ok(number.to_string()),
-        Value::Null => Err(error::validation_error(
-            field,
-            "This field may not be null.",
-        )),
-        _ => Err(error::validation_error(field, "Not a valid string.")),
-    }
-}
-
 /// Route ids are numeric, as Django's URL resolver expects. Anything else —
 /// `abc`, `1.5`, an overflowing number — simply does not match a route.
 pub fn parse_id(raw: &str) -> Option<i64> {
@@ -240,4 +311,20 @@ pub fn parse_id(raw: &str) -> Option<i64> {
         return None;
     }
     raw.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_redaction_decodes_parameter_names() {
+        let uri = Uri::from_static("/api/1/configs?foo=bar&%61uth%5ftoken=secret&auth_token=other");
+        let path = redacted_path(&uri);
+        assert!(!path.contains("secret"));
+        assert!(!path.contains("other"));
+        assert!(path.contains("foo=bar"));
+        assert!(path.contains("%61uth%5ftoken=[redacted]"));
+        assert!(path.contains("auth_token=[redacted]"));
+    }
 }

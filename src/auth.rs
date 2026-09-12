@@ -53,7 +53,7 @@ pub fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .and_then(|v| v.to_str().ok())
     {
         let mut parts = value.split_whitespace();
-        if let (Some(scheme), Some(credential)) = (parts.next(), parts.next()) {
+        if let (Some(scheme), Some(credential), None) = (parts.next(), parts.next(), parts.next()) {
             if scheme.eq_ignore_ascii_case("bearer") {
                 candidate = Some(credential.to_owned());
             }
@@ -66,7 +66,8 @@ pub fn extract_token(headers: &HeaderMap, uri: &Uri) -> Option<String> {
 fn query_token(uri: &Uri) -> Option<String> {
     let query = uri.query()?;
     form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == TOKEN_QUERY_PARAM)
+        .filter(|(key, _)| key == TOKEN_QUERY_PARAM)
+        .last()
         .map(|(_, value)| value.into_owned())
 }
 

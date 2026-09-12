@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use axum::http::{header, StatusCode};
 use common::*;
 use serde_json::json;
@@ -175,4 +177,49 @@ async fn re_upload_after_a_download_keeps_history_consistent() {
         }
         previous_modified = Some(modified);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_uploads_generate_timestamps_in_database_lock_order() {
+    let app = Arc::new(app());
+    let config_id = create_config(&app, "concurrent").await;
+    let mut set = tokio::task::JoinSet::new();
+
+    for round in 0..32 {
+        let app = app.clone();
+        set.spawn(async move {
+            let content = format!("version: 4\nround: {round}\n");
+            let reply = send(
+                &app,
+                Call::patch(format!("/api/1/configs/{config_id}")).json(&json!({
+                    "content": content,
+                    "last_used_with_version": "1.0.235",
+                })),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::OK);
+            reply.json()["modified_at"]
+                .as_str()
+                .expect("modified_at")
+                .to_owned()
+        });
+    }
+
+    let mut modified = Vec::new();
+    while let Some(result) = set.join_next().await {
+        modified.push(result.expect("upload task succeeds"));
+    }
+    assert_eq!(modified.len(), 32);
+
+    let reply = send(&app, Call::get(format!("/api/1/configs/{config_id}"))).await;
+    let stored = reply.json()["modified_at"]
+        .as_str()
+        .expect("modified_at")
+        .to_owned();
+    assert!(
+        modified
+            .iter()
+            .all(|value| value.as_str() <= stored.as_str()),
+        "stored timestamp must be no older than any response: {modified:?}, stored {stored}"
+    );
 }

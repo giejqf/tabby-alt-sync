@@ -83,7 +83,8 @@ Rules:
 - Compare in constant time. Hash both sides (SHA-256) and compare the digests with `subtle::ConstantTimeEq`, so neither the value nor its **length** leaks through timing.
 - Missing or wrong token → `401` with `WWW-Authenticate: Bearer` and body `{"detail": "Invalid token."}`.
   - Upstream actually returns `403 {"detail": "Authentication credentials were not provided."}` because DRF's `SessionAuthentication` supplies no auth header. The client only inspects `response.ok`, so this difference is unobservable. We deliberately return the semantically correct `401`. **Do not keep flip-flopping on this** — it is a settled decision.
-- The scheme comparison (`Bearer`) is case-sensitive upstream. Accept case-insensitive; it can only help.
+- The scheme comparison (`Bearer`) is case-sensitive upstream. Accept case-insensitive; it can only help. A malformed header with extra tokens is not accepted.
+- Repeated `?auth_token=` values follow Django's `QueryDict.__getitem__`: use the last value.
 
 ### Endpoints
 
@@ -91,6 +92,7 @@ Rules:
 | --- | --- | --- | --- | --- |
 | `GET` | `/api/1/user` | client's *Test connection* | — | `200` user object |
 | `PUT` | `/api/1/user` | tabby-web UI only; parity | partial user | `200` user object |
+| `PATCH` | `/api/1/user` | DRF alias; parity | partial user | `200` user object |
 | `GET` | `/api/1/configs` | client config list | — | `200` **bare JSON array** |
 | `POST` | `/api/1/configs` | *Upload as new config* | `{"name": "..."}` | `201` config object |
 | `GET` | `/api/1/configs/{id}` | download + 60 s autosync poll | — | `200` config object |
@@ -120,9 +122,9 @@ Exact shape. All keys always present, including nulls. Never add, rename, omit, 
 
 - `id` — integer. The client stores it in its own config file as `configSync.configID` and compares with `===`. Never a string, never a UUID.
 - `user` — always `1`. Vestigial, but upstream's serializer uses `fields = "__all__"`, so it is there.
-- `name` — string, shown in the client's config list.
-- `content` — **opaque string**, the client's YAML config. Store and return it byte-for-byte. Never parse it, reformat it, validate it, or re-serialize it. It routinely contains credentials (vault, SSH passwords).
-- `last_used_with_version` — nullable string. The client writes its app version on every upload.
+- `name` — string, shown in the client's config list. DRF `CharField(max_length=255)` with whitespace trimmed.
+- `content` — **opaque string**, the client's YAML config. Store and return it byte-for-byte, including NUL bytes. Never parse it, reformat it, validate it, or re-serialize it. It routinely contains credentials (vault, SSH passwords).
+- `last_used_with_version` — nullable string, DRF `CharField(max_length=32)`. The client writes its app version on every upload.
 - `created_at` / `modified_at` — DRF ISO-8601 in UTC: `%Y-%m-%dT%H:%M:%S.%6fZ`. Six fractional digits, literal `Z`, never `+00:00`.
 
 ### User object
@@ -143,26 +145,26 @@ Exact shape. All keys always present, including nulls. Never add, rename, omit, 
 
 - `is_pro` must be `true` (upstream gates features on it). `is_sponsor` is `false`.
 - `config_sync_token` echoes the token back, exactly as upstream does. This is not a leak: the caller had to present that token to get here. Do not "harden" it by redacting.
-- `active_config` is a nullable config id, persisted; settable via `PUT /api/1/user`. The desktop client never reads or writes it, but keep it working.
-- `PUT /api/1/user` ignores `id` and `username` (read-only upstream) and the derived fields; it may set `active_config`, `custom_connection_gateway`, `custom_connection_gateway_token`.
+- `active_config` is a nullable config id, persisted; settable via `PUT/PATCH /api/1/user`. An empty string clears it, as DRF's relational field does. The desktop client never reads or writes it, but keep it working.
+- `PUT/PATCH /api/1/user` ignores `id` and `username` (read-only upstream) and the derived fields; it may set `active_config`, `custom_connection_gateway`, `custom_connection_gateway_token`. Gateway strings are DRF nullable `CharField(max_length=255, blank=True)`; an explicit null clears them, while an empty string is stored as an empty string.
 
 ### Write semantics (these mirror Django model/serializer behaviour)
 
-1. **POST** may carry only `{"name": "..."}`. Defaults: `content` = `"{}"`, `last_used_with_version` = `null`. If `name` is absent or empty, generate `Unnamed config (YYYY-MM-DD)` from the server's local date.
-2. **PATCH** is a partial update: keys absent from the body are untouched. An explicit `null` for `last_used_with_version` sets null.
-3. **PUT** behaves the same as PATCH here. In DRF every writable field on this serializer is `required=False`, and a non-partial update only assigns what is in `validated_data` — so absent fields are left unchanged rather than reset. Implement PUT as an alias of PATCH.
+1. **POST** may carry only `{"name": "..."}`. Defaults: `content` = `"{}"`, `last_used_with_version` = `null`. If `name` is absent or blank, generate `Unnamed config (YYYY-MM-DD)` from the server's UTC date. Names over 255 characters or containing NUL bytes fail validation.
+2. **PATCH** is a partial update: keys absent from the body are untouched. An explicit `null` for `last_used_with_version` sets null; blank strings and values over 32 characters fail validation. On update, blank names fail validation rather than regenerating.
+3. **PUT** behaves the same as PATCH here. In DRF every writable field on this serializer is `required=False`, and a non-partial update only assigns what is in `validated_data` — so absent fields are left unchanged rather than reset. Implement PUT as an alias of PATCH. This applies to both configs and the parity-only user route.
 4. Read-only fields (`id`, `user`, `created_at`, `modified_at`) in a request body are **silently ignored**, not rejected. DRF drops them.
 5. Unknown fields in a request body are **silently ignored**.
 6. `modified_at` changes on every successful write; `created_at` never changes after creation.
 7. **DELETE** returns `204` with a completely empty body. The client does `text ? JSON.parse(text) : undefined`, so a JSON body here is wrong even though it wouldn't crash.
-8. Unknown id → `404 {"detail": "Not found."}`.
-9. Wrong method on an existing route → `405 {"detail": "Method \"DELETE\" not allowed."}`.
-10. Malformed JSON → `400 {"detail": "JSON parse error - ..."}`. Field-level validation errors use DRF's shape: an object mapping field name to an **array** of message strings, e.g. `{"name": ["Not a valid string."]}`.
+8. Unknown id → `404 {"detail": "Not found."}`. Object lookup precedes request parsing/field validation, as in DRF.
+9. Wrong method on an existing route → `405 {"detail": "Method \"DELETE\" not allowed."}` with an HTTP-standard `Allow` header listing that route's methods.
+10. Malformed JSON → `400 {"detail": "JSON parse error - ..."}`. Field-level validation errors use DRF's shape: an object mapping field name to an **array** of message strings, e.g. `{"name": ["Not a valid string."]}`; include all field errors from one serializer pass.
 11. Always respond with `Content-Type: application/json` (except the empty 204). Be lenient about the request's `Content-Type`: older clients use axios, current ones use `fetch` and only set the header when there's a body.
 
 ### Concurrency
 
-Last write wins, same as upstream. The client sends no `If-Match`/`ETag` and would ignore a `409`. Do read-modify-write inside a single SQLite transaction so `content` and `modified_at` move together.
+Last write wins, same as upstream. The client sends no `If-Match`/`ETag` and would ignore a `409`. Do read-modify-write inside a single SQLite transaction so `content` and `modified_at` move together; generate the timestamp only after acquiring the database lock.
 
 The client polls `GET /api/1/configs/{id}` every 60 s and downloads when `new Date(modified_at) > lastRemoteChange`. JS `Date` resolves to milliseconds, so two writes inside the same millisecond can look equal and delay a pull by one poll cycle. Acceptable — do not invent a version counter to work around it.
 
@@ -255,7 +257,7 @@ Required coverage:
 - **Auth matrix** per endpoint: no header, wrong token, wrong scheme, token in `?auth_token=`, token with trailing whitespace.
 - **Shape tests** asserting the exact key set of both objects — fail on extra keys as well as missing ones.
 - **Timestamp format**: match `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$`.
-- **Content round-trip**: CRLF, non-ASCII, emoji, embedded `\u0000`-free control chars, an empty string, and a 1 MiB payload all return byte-identical.
+- **Content round-trip**: CRLF, non-ASCII, emoji, control chars including `\u0000`, an empty string, and a 1 MiB payload all return byte-identical.
 - **List is a bare array**, not `{"count":…,"results":[…]}`. This is the single easiest thing to get wrong; upstream sets no DRF pagination class.
 - **Read-only and unknown fields** in a PATCH body are ignored rather than erroring.
 - Each test gets its own temp SQLite file or `:memory:`; no shared global state, tests run in parallel.

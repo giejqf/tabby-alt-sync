@@ -60,16 +60,20 @@ fn keys_of(value: &serde_json::Value) -> Vec<String> {
 
 // ---------------------------------------------------------------- auth
 
-fn endpoints() -> Vec<(Method, &'static str)> {
+fn protected_endpoints() -> Vec<(Method, &'static str)> {
     vec![
         (Method::GET, "/api/1/user"),
         (Method::PUT, "/api/1/user"),
+        (Method::PATCH, "/api/1/user"),
+        (Method::HEAD, "/api/1/user"),
         (Method::GET, "/api/1/configs"),
         (Method::POST, "/api/1/configs"),
+        (Method::HEAD, "/api/1/configs"),
         (Method::GET, "/api/1/configs/1"),
         (Method::PUT, "/api/1/configs/1"),
         (Method::PATCH, "/api/1/configs/1"),
         (Method::DELETE, "/api/1/configs/1"),
+        (Method::HEAD, "/api/1/configs/1"),
         (Method::GET, "/api/1/versions"),
     ]
 }
@@ -77,11 +81,13 @@ fn endpoints() -> Vec<(Method, &'static str)> {
 #[tokio::test]
 async fn every_api_route_requires_a_token() {
     let app = app();
-    for (method, path) in endpoints() {
+    for (method, path) in protected_endpoints() {
         let reply = send(&app, Call::new(method.clone(), path).no_auth()).await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method} {path}");
         assert_eq!(reply.header(header::WWW_AUTHENTICATE), Some("Bearer"));
-        assert_eq!(reply.json(), json!({ "detail": "Invalid token." }));
+        if method != Method::HEAD {
+            assert_eq!(reply.json(), json!({ "detail": "Invalid token." }));
+        }
     }
 }
 
@@ -106,6 +112,7 @@ async fn wrong_scheme_is_rejected() {
         format!("Bearer{TOKEN}"),
         "Bearer".to_owned(),
         "Bearer ".to_owned(),
+        format!("Bearer {TOKEN} trailing"),
     ] {
         let reply = send(&app, Call::get("/api/1/user").authorization(&header)).await;
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{header}");
@@ -157,6 +164,58 @@ async fn token_in_query_parameter_is_accepted() {
         Call::patch(format!("/api/1/configs/{created}"))
             .auth(Auth::Query)
             .json(&json!({ "content": "version: 4\n" })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn authentication_matches_on_every_protected_endpoint() {
+    let app = app();
+    for (method, path) in protected_endpoints() {
+        let mut call = Call::new(method.clone(), path).auth(Auth::Query);
+        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+            call = call.json(&json!({}));
+        }
+        let reply = send(&app, call).await;
+        assert!(
+            reply.status.is_success() || reply.status == StatusCode::NOT_FOUND,
+            "valid query auth failed for {method} {path}: {}",
+            reply.status
+        );
+
+        let mut call =
+            Call::new(method.clone(), path).authorization("Bearer wrong-token-0000000000");
+        if method != Method::GET && method != Method::HEAD && method != Method::DELETE {
+            call = call.json(&json!({}));
+        }
+        let reply = send(&app, call).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn query_token_is_percent_decoded() {
+    let app = app();
+    let encoded = TOKEN
+        .bytes()
+        .map(|byte| format!("%{byte:02X}"))
+        .collect::<String>();
+
+    let reply = send(
+        &app,
+        Call::get(format!("/api/1/user?auth_token={encoded}")).no_auth(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn repeated_query_token_uses_the_last_value_like_django_get() {
+    let app = app();
+    let reply = send(
+        &app,
+        Call::get(format!("/api/1/user?auth_token=wrong&auth_token={TOKEN}")).no_auth(),
     )
     .await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -253,6 +312,28 @@ async fn put_user_active_config_accepts_null_and_numbers_as_strings() {
 }
 
 #[tokio::test]
+async fn patch_user_updates_like_put() {
+    let app = app();
+    let id = create_config(&app, "patched active").await;
+
+    let reply = send(
+        &app,
+        Call::patch("/api/1/user").json(&json!({
+            "active_config": id,
+            "custom_connection_gateway": "gateway.example.com",
+        })),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["active_config"], json!(id));
+    assert_eq!(
+        reply.json()["custom_connection_gateway"],
+        json!("gateway.example.com")
+    );
+}
+
+#[tokio::test]
 async fn put_user_rejects_unknown_active_config_with_drf_message() {
     let app = app();
     let reply = send(
@@ -292,6 +373,47 @@ async fn put_user_rejects_non_integer_active_config() {
 }
 
 #[tokio::test]
+async fn active_config_does_not_accept_float_shaped_strings() {
+    let app = app();
+    let id = create_config(&app, "float-shaped id").await;
+    send(
+        &app,
+        Call::put("/api/1/user").json(&json!({ "active_config": id })),
+    )
+    .await;
+
+    let reply = send(
+        &app,
+        Call::put("/api/1/user").json(&json!({ "active_config": format!("{id}.0") })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        json!({ "active_config": ["A valid integer is required."] })
+    );
+
+    let reply = send(
+        &app,
+        Call::put("/api/1/user").json(&json!({ "active_config": "" })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["active_config"], json!(null));
+
+    let reply = send(
+        &app,
+        Call::put("/api/1/user").json(&json!({ "active_config": "   " })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        json!({ "active_config": ["A valid integer is required."] })
+    );
+}
+
+#[tokio::test]
 async fn put_user_custom_gateway_fields_round_trip() {
     let app = app();
 
@@ -318,6 +440,13 @@ async fn put_user_custom_gateway_fields_round_trip() {
         reply.json()["custom_connection_gateway"],
         json!("gateway.example.com")
     );
+
+    let reply = send(
+        &app,
+        Call::put("/api/1/user").json(&json!({ "custom_connection_gateway": "" })),
+    )
+    .await;
+    assert_eq!(reply.json()["custom_connection_gateway"], json!(""));
 
     let reply = send(
         &app,
@@ -353,7 +482,6 @@ async fn user_route_rejects_other_methods() {
     let app = app();
     for method in [Method::POST, Method::DELETE, Method::OPTIONS] {
         let reply = send(&app, Call::new(method.clone(), "/api/1/user").no_auth()).await;
-        // OPTIONS is answered by the CORS preflight handler before auth.
         if method == Method::OPTIONS {
             assert_eq!(reply.status, StatusCode::NO_CONTENT, "{method}");
             continue;
@@ -504,6 +632,96 @@ async fn post_accepts_content_and_version_too() {
 }
 
 #[tokio::test]
+async fn serializer_char_fields_enforce_model_lengths_and_null_characters() {
+    let app = app();
+    let id = create_config(&app, "limits").await;
+
+    let cases = [
+        ("name", json!("x".repeat(256)), Some(255), false),
+        (
+            "last_used_with_version",
+            json!("1".repeat(33)),
+            Some(32),
+            false,
+        ),
+        ("name", json!("bad\u{0}name"), Some(255), true),
+        ("name", json!("x".repeat(256) + "\u{0}"), Some(255), false),
+    ];
+    for (field, value, max_length, null_character) in cases {
+        let reply = send(
+            &app,
+            Call::patch(format!("/api/1/configs/{id}")).json(&json!({ field: value })),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{field}");
+        let message = if null_character {
+            "Null characters are not allowed.".to_owned()
+        } else {
+            format!(
+                "Ensure this field has no more than {} characters.",
+                max_length.expect("max length")
+            )
+        };
+        assert_eq!(reply.json(), json!({ field: [message] }));
+    }
+
+    let reply = send(
+        &app,
+        Call::patch(format!("/api/1/configs/{id}")).json(&json!({ "content": "version: 4\0" })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["content"], json!("version: 4\0"));
+
+    let reply = send(
+        &app,
+        Call::put("/api/1/user").json(&json!({
+            "custom_connection_gateway": "x".repeat(256),
+            "custom_connection_gateway_token": "y".repeat(256),
+        })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        json!({
+            "custom_connection_gateway": ["Ensure this field has no more than 255 characters."],
+            "custom_connection_gateway_token": ["Ensure this field has no more than 255 characters."],
+        })
+    );
+
+    let reply = send(&app, Call::get("/api/1/user")).await;
+    assert_eq!(reply.json()["custom_connection_gateway"], json!(null));
+}
+
+#[tokio::test]
+async fn serializer_reports_all_invalid_fields_together() {
+    let app = app();
+    let reply = send(
+        &app,
+        Call::post("/api/1/configs").json(&json!({
+            "name": true,
+            "content": ["not a string"],
+            "last_used_with_version": {"also": "not a string"},
+        })),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        json!({
+            "name": ["Not a valid string."],
+            "content": ["Not a valid string."],
+            "last_used_with_version": ["Not a valid string."],
+        })
+    );
+
+    let reply = send(&app, Call::get("/api/1/configs")).await;
+    assert_eq!(reply.json(), json!([]));
+}
+
+#[tokio::test]
 async fn patch_is_partial_and_touches_only_modified_at() {
     let app = app();
     let id = create_config(&app, "keep me").await;
@@ -586,6 +804,50 @@ async fn patch_sets_explicit_nulls() {
 }
 
 #[tokio::test]
+async fn update_rejects_blank_required_char_fields_but_trims_valid_values() {
+    let app = app();
+    let id = create_config(&app, "blanks").await;
+
+    let reply = send(
+        &app,
+        Call::patch(format!("/api/1/configs/{id}")).json(&json!({ "content": null })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reply.json(),
+        json!({ "content": ["This field may not be null."] })
+    );
+
+    for (field, value) in [
+        ("name", json!(" ")),
+        ("last_used_with_version", json!(" ")),
+        ("name", json!("")),
+        ("last_used_with_version", json!("")),
+    ] {
+        let reply = send(
+            &app,
+            Call::patch(format!("/api/1/configs/{id}")).json(&json!({ field: value })),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(
+            reply.json(),
+            json!({ field: ["This field may not be blank."] })
+        );
+    }
+
+    let reply = send(
+        &app,
+        Call::patch(format!("/api/1/configs/{id}"))
+            .json(&json!({ "last_used_with_version": "  1.0.235  " })),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["last_used_with_version"], json!("1.0.235"));
+}
+
+#[tokio::test]
 async fn put_behaves_exactly_like_patch() {
     let app = app();
     let id = create_config(&app, "via put").await;
@@ -656,6 +918,20 @@ async fn unknown_id_is_not_found_on_every_method() {
 }
 
 #[tokio::test]
+async fn object_lookup_precedes_body_parsing_like_drf() {
+    let app = app();
+    let reply = send(
+        &app,
+        Call::patch("/api/1/configs/4242")
+            .content_type("application/json")
+            .body("{"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(reply.json(), json!({ "detail": "Not found." }));
+}
+
+#[tokio::test]
 async fn non_numeric_id_is_not_found() {
     let app = app();
     for path in [
@@ -706,18 +982,47 @@ async fn wrong_method_on_an_existing_route_is_405() {
     let id = create_config(&app, "method check").await;
 
     let cases = [
-        (Method::DELETE, "/api/1/configs".to_owned()),
-        (Method::PUT, "/api/1/configs".to_owned()),
-        (Method::PATCH, "/api/1/configs".to_owned()),
-        (Method::POST, format!("/api/1/configs/{id}")),
-        (Method::DELETE, "/api/1/user".to_owned()),
-        (Method::POST, "/api/1/user".to_owned()),
+        (
+            Method::DELETE,
+            "/api/1/configs".to_owned(),
+            "GET, POST, HEAD, OPTIONS",
+        ),
+        (
+            Method::PUT,
+            "/api/1/configs".to_owned(),
+            "GET, POST, HEAD, OPTIONS",
+        ),
+        (
+            Method::PATCH,
+            "/api/1/configs".to_owned(),
+            "GET, POST, HEAD, OPTIONS",
+        ),
+        (
+            Method::POST,
+            format!("/api/1/configs/{id}"),
+            "GET, PUT, PATCH, DELETE, HEAD, OPTIONS",
+        ),
+        (
+            Method::DELETE,
+            "/api/1/user".to_owned(),
+            "GET, PUT, PATCH, HEAD, OPTIONS",
+        ),
+        (
+            Method::POST,
+            "/api/1/user".to_owned(),
+            "GET, PUT, PATCH, HEAD, OPTIONS",
+        ),
     ];
-    for (method, path) in cases {
+    for (method, path, allowed) in cases {
         let reply = send(&app, Call::new(method.clone(), &path).body("{}")).await;
         assert_eq!(
             reply.status,
             StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path}"
+        );
+        assert_eq!(
+            reply.header(header::ALLOW),
+            Some(allowed),
             "{method} {path}"
         );
         assert_eq!(
@@ -795,6 +1100,7 @@ async fn content_round_trips_byte_for_byte() {
     let cases: Vec<(&str, String)> = vec![
         ("empty", String::new()),
         ("plain", "version: 4\nprofiles: []\n".to_owned()),
+        ("preserved whitespace", "  version: 4  \n".to_owned()),
         (
             "crlf",
             "version: 4\r\nprofiles:\r\n  - name: a\r\n".to_owned(),
@@ -803,7 +1109,7 @@ async fn content_round_trips_byte_for_byte() {
         ("emoji", "name: 🦊🔐🖥️\n".to_owned()),
         (
             "control chars",
-            "a\tb\u{1}\u{2}\u{1b}[0m\u{7f}\n".to_owned(),
+            "a\tb\u{0}\u{1}\u{2}\u{1b}[0m\u{7f}\n".to_owned(),
         ),
         (
             "quotes and backslashes",

@@ -5,12 +5,18 @@ use axum::Json;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use super::error::ApiError;
+use super::error::{ApiError, ValidationErrors};
 use super::{
-    nullable_string_field, parse_id, parse_json_object, read_body, string_field, AppState, USER_ID,
+    nullable_string_field, parse_id, parse_json_object, read_body, string_field, AppState,
+    CharFieldRules, USER_ID,
 };
 use crate::db::configs::{self, ConfigChanges, ConfigRow, NewConfig};
 use crate::time;
+
+const NAME_MAX_LENGTH: usize = 255;
+const VERSION_MAX_LENGTH: usize = 32;
+const COLLECTION_ALLOWED_METHODS: &str = "GET, POST, HEAD, OPTIONS";
+const ITEM_ALLOWED_METHODS: &str = "GET, PUT, PATCH, DELETE, HEAD, OPTIONS";
 
 /// The config object, exactly as tabby-web's `ConfigSerializer` emits it: every
 /// key always present (nulls included), no camelCase, no extra keys
@@ -48,7 +54,10 @@ pub async fn collection(State(state): State<AppState>, req: Request) -> Result<R
             let body = read_body(req, state.max_body_bytes).await?;
             create(&state, parse_json_object(&body)?)
         }
-        _ => Err(ApiError::MethodNotAllowed(method_of(&req).to_string())),
+        _ => Err(ApiError::MethodNotAllowed {
+            method: method_of(&req).to_owned(),
+            allowed: COLLECTION_ALLOWED_METHODS,
+        }),
     }
 }
 
@@ -66,10 +75,13 @@ pub async fn item(
         "GET" | "HEAD" => fetch(&state, id),
         "PUT" | "PATCH" => {
             let body = read_body(req, state.max_body_bytes).await?;
-            update(&state, id, parse_json_object(&body)?)
+            update(&state, id, &body)
         }
         "DELETE" => remove(&state, id),
-        _ => Err(ApiError::MethodNotAllowed(method_of(&req).to_string())),
+        _ => Err(ApiError::MethodNotAllowed {
+            method: method_of(&req).to_owned(),
+            allowed: ITEM_ALLOWED_METHODS,
+        }),
     }
 }
 
@@ -90,16 +102,29 @@ fn fetch(state: &AppState, id: i64) -> Result<Response, ApiError> {
 }
 
 fn create(state: &AppState, body: Option<Map<String, Value>>) -> Result<Response, ApiError> {
-    let name = match provided_name(body.as_ref())? {
-        Some(name) => name,
-        None => fallback_name()?,
-    };
-    let content = string_field(body.as_ref(), "content")?;
-    let last_used_with_version =
-        nullable_string_field(body.as_ref(), "last_used_with_version")?.flatten();
-    let timestamp = time::now_wire()?;
+    let mut errors = ValidationErrors::default();
+    let name = provided_name(body.as_ref(), &mut errors, true);
+    let content = string_field(
+        body.as_ref(),
+        "content",
+        CharFieldRules::new(None).raw().allow_blank(),
+        &mut errors,
+    );
+    let last_used_with_version = nullable_string_field(
+        body.as_ref(),
+        "last_used_with_version",
+        CharFieldRules::new(Some(VERSION_MAX_LENGTH)),
+        &mut errors,
+    )
+    .flatten();
+    errors.finish()?;
 
     let conn = state.db.lock()?;
+    let timestamp = time::now_wire()?;
+    let name = match name {
+        Some(name) if !name.is_empty() => name,
+        _ => fallback_name()?,
+    };
     let row = configs::create(
         &conn,
         NewConfig {
@@ -116,19 +141,32 @@ fn create(state: &AppState, body: Option<Map<String, Value>>) -> Result<Response
 /// PUT behaves exactly like PATCH: every writable field on the upstream
 /// serializer is `required = False`, so a non-partial update only assigns what
 /// the body carries.
-fn update(
-    state: &AppState,
-    id: i64,
-    body: Option<Map<String, Value>>,
-) -> Result<Response, ApiError> {
-    let changes = ConfigChanges {
-        name: provided_name(body.as_ref())?,
-        content: string_field(body.as_ref(), "content")?,
-        last_used_with_version: nullable_string_field(body.as_ref(), "last_used_with_version")?,
-    };
-    let timestamp = time::now_wire()?;
-
+fn update(state: &AppState, id: i64, body: &[u8]) -> Result<Response, ApiError> {
     let mut conn = state.db.lock()?;
+    if configs::get(&conn, id)?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+
+    let body = parse_json_object(body)?;
+    let mut errors = ValidationErrors::default();
+    let changes = ConfigChanges {
+        name: provided_name(body.as_ref(), &mut errors, false),
+        content: string_field(
+            body.as_ref(),
+            "content",
+            CharFieldRules::new(None).raw().allow_blank(),
+            &mut errors,
+        ),
+        last_used_with_version: nullable_string_field(
+            body.as_ref(),
+            "last_used_with_version",
+            CharFieldRules::new(Some(VERSION_MAX_LENGTH)),
+            &mut errors,
+        ),
+    };
+    errors.finish()?;
+
+    let timestamp = time::now_wire()?;
     match configs::update(&mut conn, id, &changes, &timestamp)? {
         Some(row) => Ok(Json(ConfigJson::from(&row)).into_response()),
         None => Err(ApiError::NotFound),
@@ -144,18 +182,16 @@ fn remove(state: &AppState, id: i64) -> Result<Response, ApiError> {
     }
 }
 
-/// A missing or blank `name` falls back to `Unnamed config (YYYY-MM-DD)`, the
-/// default tabby-web applies in `Config.save()`
-/// (`backend/tabby/app/models.py`).
-fn provided_name(body: Option<&Map<String, Value>>) -> Result<Option<String>, ApiError> {
-    let Some(name) = string_field(body, "name")? else {
-        return Ok(None);
-    };
-    let name = name.trim();
-    if name.is_empty() {
-        return Ok(Some(fallback_name()?));
+fn provided_name(
+    body: Option<&Map<String, Value>>,
+    errors: &mut ValidationErrors,
+    allow_blank: bool,
+) -> Option<String> {
+    let mut rules = CharFieldRules::new(Some(NAME_MAX_LENGTH));
+    if allow_blank {
+        rules = rules.allow_blank();
     }
-    Ok(Some(name.to_owned()))
+    string_field(body, "name", rules, errors)
 }
 
 fn fallback_name() -> Result<String, ApiError> {

@@ -18,8 +18,11 @@ pub enum ApiError {
     #[error("not found")]
     NotFound,
 
-    #[error("method {0} not allowed")]
-    MethodNotAllowed(String),
+    #[error("method {method} not allowed")]
+    MethodNotAllowed {
+        method: String,
+        allowed: &'static str,
+    },
 
     #[error("malformed JSON body: {0}")]
     JsonParse(String),
@@ -45,6 +48,31 @@ pub fn validation_error(field: &str, message: &str) -> ApiError {
     let mut errors = Map::new();
     errors.insert(field.to_owned(), json!([message]));
     ApiError::Validation(errors)
+}
+
+#[derive(Debug, Default)]
+pub struct ValidationErrors {
+    errors: Map<String, Value>,
+}
+
+impl ValidationErrors {
+    pub fn add(&mut self, field: &str, message: &str) {
+        let messages = self
+            .errors
+            .entry(field.to_owned())
+            .or_insert_with(|| json!([]));
+        if let Some(list) = messages.as_array_mut() {
+            list.push(json!(message));
+        }
+    }
+
+    pub fn finish(self) -> Result<(), ApiError> {
+        if self.errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiError::Validation(self.errors))
+        }
+    }
 }
 
 /// DRF rejects a request body that is valid JSON but not an object with
@@ -82,8 +110,9 @@ impl IntoResponse for ApiError {
             )
                 .into_response(),
             ApiError::NotFound => (StatusCode::NOT_FOUND, Json(not_found_body())).into_response(),
-            ApiError::MethodNotAllowed(method) => (
+            ApiError::MethodNotAllowed { method, allowed } => (
                 StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, allowed)],
                 Json(json!({ "detail": format!("Method \"{method}\" not allowed.") })),
             )
                 .into_response(),
